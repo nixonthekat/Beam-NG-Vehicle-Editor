@@ -26,7 +26,7 @@ pub struct VehicleConfig {
 impl VehicleConfig {
     pub fn load(path: &Path) -> AppResult<Self> {
         let text = fs::read_to_string(path)?;
-        let raw: Value = serde_json::from_str(&text)?;
+        let raw = crate::json_util::parse_beamng_json(&text)?;
         let parts = extract_parts(&raw)?;
         Ok(Self {
             path: path.to_path_buf(),

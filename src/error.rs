@@ -23,6 +23,12 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+impl From<zip::result::ZipError> for AppError {
+    fn from(value: zip::result::ZipError) -> Self {
+        AppError::Message(value.to_string())
+    }
+}
+
 impl AppError {
     pub fn msg(message: impl Into<String>) -> Self {
         AppError::Message(message.into())

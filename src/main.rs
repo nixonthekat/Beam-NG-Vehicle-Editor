@@ -4,9 +4,15 @@ mod config;
 mod engine;
 mod error;
 mod gui;
+mod json_util;
+mod mod_scanner;
+mod scan_util;
 mod scanner;
 mod settings;
 mod state;
+mod parts;
+mod thumbnail;
+mod vehicle_source;
 
 use app::BeamNgVehicleEditor;
 
@@ -15,8 +21,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 600.0])
+            .with_inner_size([1024.0, 733.0])
+            .with_min_inner_size([1024.0, 733.0])
             .with_title("BeamNG Vehicle Editor"),
         ..Default::default()
     };

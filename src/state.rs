@@ -1,19 +1,19 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use egui::{ColorImage, TextureHandle, TextureOptions};
-
 use crate::backup::{BackupIndex, BackupMetadata};
 use crate::config::VehicleConfig;
-use crate::engine::EnginePart;
-use crate::scanner::{ScanMessage, VehicleEntry};
+use crate::mod_scanner::{ModEntry, ModKind, ModScanMessage, ModStorage};
+use crate::scanner::{ScanMessage, VehicleCategory, VehicleEntry};
 use crate::settings::AppSettings;
+use crate::thumbnail::ThumbnailCache;
+use crate::vehicle_source::VehicleLocation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppTab {
     Grid,
+    Mods,
     Editor,
     Backups,
     Settings,
@@ -54,56 +54,6 @@ pub struct UndoSnapshot {
     pub label: String,
 }
 
-pub struct ThumbnailCache {
-    textures: HashMap<String, TextureHandle>,
-    pending: HashMap<String, ColorImage>,
-}
-
-impl ThumbnailCache {
-    pub fn new() -> Self {
-        Self {
-            textures: HashMap::new(),
-            pending: HashMap::new(),
-        }
-    }
-
-    pub fn queue_load(&mut self, id: &str, path: &PathBuf) {
-        if self.textures.contains_key(id) || self.pending.contains_key(id) {
-            return;
-        }
-        if let Ok(img) = load_image_color(path) {
-            self.pending.insert(id.to_string(), img);
-        }
-    }
-
-    pub fn upload_pending(&mut self, ctx: &egui::Context) {
-        let pending: Vec<_> = self.pending.drain().collect();
-        for (id, color) in pending {
-            let texture = ctx.load_texture(
-                format!("thumb_{id}"),
-                color,
-                TextureOptions::LINEAR,
-            );
-            self.textures.insert(id, texture);
-        }
-    }
-
-    pub fn get(&self, id: &str) -> Option<&TextureHandle> {
-        self.textures.get(id)
-    }
-
-    pub fn clear(&mut self) {
-        self.textures.clear();
-        self.pending.clear();
-    }
-}
-
-fn load_image_color(path: &PathBuf) -> Result<ColorImage, image::ImageError> {
-    let img = image::open(path)?.to_rgba8();
-    let size = [img.width() as usize, img.height() as usize];
-    Ok(ColorImage::from_rgba_unmultiplied(size, &img))
-}
-
 pub struct AppState {
     pub settings: AppSettings,
     pub tab: AppTab,
@@ -113,27 +63,44 @@ pub struct AppState {
     pub mod_filter: Option<String>,
     pub stock_only: bool,
     pub mod_only: bool,
+    pub saved_only: bool,
+
+    pub mods: Vec<ModEntry>,
+    pub selected_mod_id: Option<String>,
+    pub mod_add_vehicle: String,
+    pub mod_template_vehicle: String,
+    pub mod_scan_rx: Option<Receiver<ModScanMessage>>,
+    pub mod_scanning: bool,
+    pub mod_scan_progress: Option<(usize, String)>,
+    pub pending_mod_remove: Option<String>,
 
     pub loaded_config: Option<VehicleConfig>,
+    pub loaded_location: Option<VehicleLocation>,
     pub edit_buffer: Option<VehicleConfig>,
     pub slot_edits: HashMap<String, String>,
+    pub slot_undo_pending: std::collections::HashSet<String>,
 
     pub backup_index: BackupIndex,
     pub pending_restore: Option<BackupMetadata>,
     pub pending_restore_all: bool,
 
-    pub engines: Vec<EnginePart>,
+    pub parts_index: crate::parts::PartsIndex,
+    pub parts_collect: Vec<crate::parts::PartEntry>,
+    pub parts_scan_rx: Option<Receiver<crate::parts::PartsScanMessage>>,
+    pub parts_scanning: bool,
+    pub parts_scan_progress: Option<(usize, String)>,
+
     pub engine_search: String,
     pub engine_mod_filter: Option<String>,
     pub show_engine_browser: bool,
+    pub selected_engine_mod: Option<String>,
+
+    pub slot_custom_mode: std::collections::HashSet<String>,
+    pub slot_filter: String,
 
     pub scan_rx: Option<Receiver<ScanMessage>>,
     pub scan_progress: Option<(usize, String)>,
     pub scanning: bool,
-
-    pub engine_scan_rx: Option<Receiver<crate::engine::EngineScanMessage>>,
-    pub engine_scanning: bool,
-    pub engine_scan_progress: Option<(usize, String)>,
 
     pub thumbnails: ThumbnailCache,
     pub toasts: VecDeque<Toast>,
@@ -145,18 +112,24 @@ pub struct AppState {
     pub status_message: String,
 
     // UI action requests (processed by app each frame)
+    pub request_user_browse: bool,
     pub request_rescan: bool,
     pub request_mods_browse: bool,
     pub request_exe_browse: bool,
     pub request_save_settings: bool,
-    pub request_load_vehicle: Option<PathBuf>,
+    pub request_load_vehicle_id: Option<String>,
     pub request_apply: bool,
     pub request_restore_latest: bool,
+    pub request_parts_scan: bool,
     pub request_engine_scan: bool,
     pub request_assign_engine: Option<String>,
+    pub request_unpack_mod_id: Option<String>,
+    pub request_pack_mod_id: Option<String>,
+    pub request_add_car_to_mod_id: Option<String>,
     pub confirm_restore: bool,
     pub confirm_restore_all: bool,
     pub backup_vehicle_filter: Option<String>,
+    pub request_drive: bool,
 }
 
 impl AppState {
@@ -170,41 +143,62 @@ impl AppState {
             mod_filter: None,
             stock_only: false,
             mod_only: false,
+            saved_only: false,
+            mods: Vec::new(),
+            selected_mod_id: None,
+            mod_add_vehicle: String::new(),
+            mod_template_vehicle: String::new(),
+            mod_scan_rx: None,
+            mod_scanning: false,
+            mod_scan_progress: None,
+            pending_mod_remove: None,
             loaded_config: None,
+            loaded_location: None,
             edit_buffer: None,
             slot_edits: HashMap::new(),
+            slot_undo_pending: std::collections::HashSet::new(),
             backup_index,
             pending_restore: None,
             pending_restore_all: false,
-            engines: Vec::new(),
+            parts_index: crate::parts::PartsIndex::default(),
+            parts_collect: Vec::new(),
+            parts_scan_rx: None,
+            parts_scanning: false,
+            parts_scan_progress: None,
             engine_search: String::new(),
             engine_mod_filter: None,
             show_engine_browser: false,
+            selected_engine_mod: None,
+            slot_custom_mode: std::collections::HashSet::new(),
+            slot_filter: String::new(),
             scan_rx: None,
             scan_progress: None,
             scanning: false,
-            engine_scan_rx: None,
-            engine_scanning: false,
-            engine_scan_progress: None,
             thumbnails: ThumbnailCache::new(),
             toasts: VecDeque::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             dirty: false,
             last_external_check: Instant::now(),
-            status_message: "Set your BeamNG mods folder in Settings to begin.".to_string(),
+            status_message: "Set BeamNG user folder and exe in Settings, then Rescan.".to_string(),
+            request_user_browse: false,
             request_rescan: false,
             request_mods_browse: false,
             request_exe_browse: false,
             request_save_settings: false,
-            request_load_vehicle: None,
+            request_load_vehicle_id: None,
             request_apply: false,
             request_restore_latest: false,
+            request_parts_scan: false,
             request_engine_scan: false,
             request_assign_engine: None,
+            request_unpack_mod_id: None,
+            request_pack_mod_id: None,
+            request_add_car_to_mod_id: None,
             confirm_restore: false,
             confirm_restore_all: false,
             backup_vehicle_filter: None,
+            request_drive: false,
         }
     }
 
@@ -225,10 +219,13 @@ impl AppState {
         self.vehicles
             .iter()
             .filter(|v| {
-                if self.stock_only && !v.is_stock {
+                if self.saved_only && v.category != VehicleCategory::Saved {
                     return false;
                 }
-                if self.mod_only && v.is_stock {
+                if self.stock_only && v.category != VehicleCategory::Stock {
+                    return false;
+                }
+                if self.mod_only && v.category != VehicleCategory::Mod {
                     return false;
                 }
                 if let Some(ref m) = self.mod_filter {
@@ -242,8 +239,68 @@ impl AppState {
                 v.name.to_ascii_lowercase().contains(&q)
                     || v.id.to_ascii_lowercase().contains(&q)
                     || v.mod_name.to_ascii_lowercase().contains(&q)
+                    || v.model_key.to_ascii_lowercase().contains(&q)
             })
             .collect()
+    }
+
+    pub fn selected_mod(&self) -> Option<&ModEntry> {
+        let id = self.selected_mod_id.as_ref()?;
+        self.mods.iter().find(|m| &m.id == id)
+    }
+
+    pub fn filtered_mods(&self) -> Vec<&ModEntry> {
+        let q = self.search_query.trim().to_ascii_lowercase();
+        self.mods
+            .iter()
+            .filter(|m| {
+                q.is_empty()
+                    || m.name.to_ascii_lowercase().contains(&q)
+                    || m.id.to_ascii_lowercase().contains(&q)
+                    || m.target_vehicles.iter().any(|v| v.to_ascii_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
+    pub fn filtered_mods_by_storage(&self, storage: ModStorage) -> Vec<&ModEntry> {
+        self.filtered_mods()
+            .into_iter()
+            .filter(|m| m.storage == storage)
+            .collect()
+    }
+
+    pub fn engine_mod_entries(&self) -> Vec<&ModEntry> {
+        self.mods
+            .iter()
+            .filter(|m| m.kind == ModKind::EngineParts || m.engine_count > 0)
+            .collect()
+    }
+
+    pub fn current_vehicle_model(&self) -> Option<String> {
+        if let Some(v) = self.selected_vehicle() {
+            if !v.model_key.is_empty() {
+                return Some(v.model_key.clone());
+            }
+        }
+        if let Some(buf) = &self.edit_buffer {
+            if let Some(model) = buf.raw.get("model").and_then(|v| v.as_str()) {
+                return Some(model.to_string());
+            }
+            if let Some(model) = buf.raw.get("mainPartName").and_then(|v| v.as_str()) {
+                return Some(model.to_string());
+            }
+        }
+        None
+    }
+
+    pub fn mod_by_name(&self, name: &str) -> Option<&ModEntry> {
+        self.mods
+            .iter()
+            .filter(|m| m.name.eq_ignore_ascii_case(name))
+            .max_by_key(|m| match m.storage {
+                ModStorage::Unpacked => 1,
+                ModStorage::Packed => 0,
+            })
     }
 
     pub fn mod_names(&self) -> Vec<String> {
