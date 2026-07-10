@@ -161,46 +161,40 @@ impl PartsScanner {
     pub fn spawn_scan(settings: AppSettings) -> Receiver<PartsScanMessage> {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            if let Err(err) = Self::scan(&settings, &tx) {
-                let _ = tx.send(PartsScanMessage::Error(err.to_string()));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::scan(&settings, &tx)
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let _ = tx.send(PartsScanMessage::Error(err.to_string()));
+                    let _ = tx.send(PartsScanMessage::Finished { total: 0 });
+                }
+                Err(_) => {
+                    let _ = tx.send(PartsScanMessage::Error(
+                        "Engine scan crashed — check debug output".to_string(),
+                    ));
+                    let _ = tx.send(PartsScanMessage::Finished { total: 0 });
+                }
             }
         });
         rx
     }
 
     fn scan(settings: &AppSettings, tx: &Sender<PartsScanMessage>) -> AppResult<()> {
-        let mut roots = Vec::new();
-        if let Some(mods) = settings.mods_dir() {
-            roots.push(mods);
-        }
-        if let Some(game) = settings.game_loose_vehicles_dir() {
-            roots.push(game);
-        }
-
-        if roots.is_empty() && settings.game_vehicles_dir().is_none() {
+        let Some(mods_root) = settings.mods_dir() else {
             return Err(AppError::msg("Set BeamNG user folder or BeamNG.exe in Settings"));
-        }
+        };
 
         let mut scanned = 0usize;
         let mut seen_ids = BTreeSet::new();
 
-        for root in roots {
-            let mod_label = root
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("mod");
-            scan_jbeam_tree(&root, &root, mod_label, tx, &mut scanned, &mut seen_ids)?;
-            scan_unpacked_mods(&root, tx, &mut scanned, &mut seen_ids)?;
-            for zip_dir in mod_zip_dirs(&root) {
-                if zip_dir.file_name().and_then(|s| s.to_str()) == Some("unpacked") {
-                    continue;
-                }
-                scan_zip_jbeams_in_dir(&zip_dir, tx, &mut scanned, &mut seen_ids)?;
+        scan_unpacked_mods(&mods_root, tx, &mut scanned, &mut seen_ids)?;
+        for zip_dir in mod_zip_dirs(&mods_root) {
+            if zip_dir.file_name().and_then(|s| s.to_str()) == Some("unpacked") {
+                continue;
             }
-        }
-
-        if let Some(stock_dir) = settings.game_vehicles_dir() {
-            scan_stock_zip_jbeams(&stock_dir, tx, &mut scanned, &mut seen_ids)?;
+            scan_zip_jbeams_in_dir(&zip_dir, tx, &mut scanned, &mut seen_ids)?;
         }
 
         let _ = tx.send(PartsScanMessage::Finished { total: scanned });
@@ -225,16 +219,20 @@ fn scan_jbeam_tree(
         if !path.is_file() {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("jbeam") {
+        if path.extension().and_then(|e| e.to_str()).is_none_or(|e| !e.eq_ignore_ascii_case("jbeam")) {
             continue;
         }
 
         *scanned += 1;
-        if *scanned % 40 == 0 {
+        if *scanned % 10 == 0 {
             let _ = tx.send(PartsScanMessage::Progress {
                 scanned: *scanned,
                 message: path.display().to_string(),
             });
+        }
+
+        if !jbeam_path_likely_engine(path) {
+            continue;
         }
 
         if let Ok(parts) = parse_jbeam_parts(path, mod_label) {
@@ -296,23 +294,6 @@ fn scan_zip_jbeams_in_dir(
     Ok(())
 }
 
-fn scan_stock_zip_jbeams(
-    stock_dir: &Path,
-    tx: &Sender<PartsScanMessage>,
-    scanned: &mut usize,
-    seen_ids: &mut BTreeSet<String>,
-) -> AppResult<()> {
-    if let Ok(read_dir) = std::fs::read_dir(stock_dir) {
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("zip") {
-                scan_jbeams_in_zip(&path, "BeamNG", tx, scanned, seen_ids)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 fn scan_jbeams_in_zip(
     zip_path: &Path,
     mod_name: &str,
@@ -329,8 +310,17 @@ fn scan_jbeams_in_zip(
             continue;
         }
         *scanned += 1;
+        if *scanned % 10 == 0 {
+            let _ = tx.send(PartsScanMessage::Progress {
+                scanned: *scanned,
+                message: format!("{}:{}", zip_path.display(), name),
+            });
+        }
         let mut text = String::new();
         file.read_to_string(&mut text)?;
+        if !text_likely_engine_jbeam(&text) {
+            continue;
+        }
         if let Ok(parts) = parse_jbeam_text(&text, mod_name, zip_path) {
             for part in parts {
                 if seen_ids.insert(part.id.clone()) {
@@ -343,7 +333,7 @@ fn scan_jbeams_in_zip(
 }
 
 fn parse_jbeam_text(text: &str, mod_name: &str, source: &Path) -> AppResult<Vec<PartEntry>> {
-    let value: serde_json::Value = serde_json::from_str(text)?;
+    let value = crate::json_util::parse_beamng_json(text)?;
     let mut parts = Vec::new();
     let Some(root_obj) = value.as_object() else {
         return Ok(parts);
@@ -369,6 +359,9 @@ fn parse_jbeam_text(text: &str, mod_name: &str, source: &Path) -> AppResult<Vec<
         let is_engine = is_engine_slot_name(&slot_type)
             || part_id.to_ascii_lowercase().contains("engine")
             || name.to_ascii_lowercase().contains("engine");
+        if !is_engine {
+            continue;
+        }
         if slot_type.is_empty() && !is_engine {
             continue;
         }
@@ -399,7 +392,7 @@ fn infer_mod_name(root: &Path, path: &Path) -> String {
 
 fn parse_jbeam_parts(path: &Path, mod_name: &str) -> AppResult<Vec<PartEntry>> {
     let text = std::fs::read_to_string(path)?;
-    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let value = crate::json_util::parse_beamng_json(&text)?;
     let mut parts = Vec::new();
 
     let Some(root_obj) = value.as_object() else {
@@ -431,6 +424,9 @@ fn parse_jbeam_parts(path: &Path, mod_name: &str) -> AppResult<Vec<PartEntry>> {
             || part_id.to_ascii_lowercase().contains("engine")
             || name.to_ascii_lowercase().contains("engine");
 
+        if !is_engine {
+            continue;
+        }
         if slot_type.is_empty() && !is_engine {
             continue;
         }
@@ -452,12 +448,75 @@ fn parse_jbeam_parts(path: &Path, mod_name: &str) -> AppResult<Vec<PartEntry>> {
     Ok(parts)
 }
 
+pub fn count_engines_in_jbeam_text(text: &str) -> usize {
+    let value = match crate::json_util::parse_beamng_json(text) {
+        Ok(v) => v,
+        Err(_) => return if text_likely_engine_jbeam(text) { 1 } else { 0 },
+    };
+    let Some(root_obj) = value.as_object() else {
+        return 0;
+    };
+    let mut count = 0usize;
+    for (part_id, part_val) in root_obj {
+        if part_id.starts_with("__") {
+            continue;
+        }
+        let Some(part_obj) = part_val.as_object() else {
+            continue;
+        };
+        let slot_type = part_obj
+            .get("slotType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = part_obj
+            .get("information")
+            .and_then(|i| i.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or(part_id);
+        if is_engine_slot_name(slot_type)
+            || part_id.to_ascii_lowercase().contains("engine")
+            || name.to_ascii_lowercase().contains("engine")
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn text_likely_engine_jbeam(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("engine") && (lower.contains("slottype") || lower.contains("mainengine"))
+}
+
 pub fn is_engine_slot_name(slot: &str) -> bool {
     let lower = slot.to_ascii_lowercase();
     ENGINE_SLOT_NAMES
         .iter()
         .any(|s| lower.contains(&s.to_ascii_lowercase()))
         || lower.contains("engine")
+}
+
+fn jbeam_name_likely_engine(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("engine") || lower.contains("motor") || lower.contains("powertrain")
+}
+
+fn jbeam_path_likely_engine(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if jbeam_name_likely_engine(&name) {
+        return true;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 4096];
+    let Ok(n) = std::io::Read::read(&mut file, &mut buf) else {
+        return false;
+    };
+    text_likely_engine_jbeam(&String::from_utf8_lossy(&buf[..n]))
 }
 
 pub fn friendly_slot_label(slot: &str) -> String {
@@ -492,24 +551,26 @@ pub fn engine_mods_sorted(index: &PartsIndex) -> Vec<&EngineModInfo> {
     mods
 }
 
+pub fn engine_belongs_to_mod(engine: &PartEntry, mod_name: &str) -> bool {
+    let name_lower = mod_name.to_ascii_lowercase();
+    engine.mod_name.eq_ignore_ascii_case(mod_name)
+        || engine
+            .source_file
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains(&name_lower)
+}
+
 pub fn filter_parts_for_mod_entry<'a>(
     index: &'a PartsIndex,
     mod_name: &str,
     query: &str,
 ) -> Vec<&'a PartEntry> {
     let q = query.trim().to_ascii_lowercase();
-    let name_lower = mod_name.to_ascii_lowercase();
     index
         .engines
         .iter()
-        .filter(|e| {
-            e.mod_name.eq_ignore_ascii_case(mod_name)
-                || e
-                    .source_file
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .contains(&name_lower)
-        })
+        .filter(|e| engine_belongs_to_mod(e, mod_name))
         .filter(|e| {
             q.is_empty()
                 || e.id.to_ascii_lowercase().contains(&q)

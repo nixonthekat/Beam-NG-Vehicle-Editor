@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::backup::{BackupIndex, BackupMetadata};
 use crate::config::VehicleConfig;
-use crate::mod_scanner::{ModEntry, ModKind, ModScanMessage, ModStorage};
+use crate::mod_scanner::{ModEntry, ModScanMessage, ModStorage};
 use crate::scanner::{ScanMessage, VehicleCategory, VehicleEntry};
 use crate::settings::AppSettings;
 use crate::thumbnail::ThumbnailCache;
@@ -73,6 +73,7 @@ pub struct AppState {
     pub mod_scanning: bool,
     pub mod_scan_progress: Option<(usize, String)>,
     pub pending_mod_remove: Option<String>,
+    pub pending_adapter_remove: Option<(String, String)>,
 
     pub loaded_config: Option<VehicleConfig>,
     pub loaded_location: Option<VehicleLocation>,
@@ -88,6 +89,7 @@ pub struct AppState {
     pub parts_collect: Vec<crate::parts::PartEntry>,
     pub parts_scan_rx: Option<Receiver<crate::parts::PartsScanMessage>>,
     pub parts_scanning: bool,
+    pub parts_scan_done: bool,
     pub parts_scan_progress: Option<(usize, String)>,
 
     pub engine_search: String,
@@ -152,6 +154,7 @@ impl AppState {
             mod_scanning: false,
             mod_scan_progress: None,
             pending_mod_remove: None,
+            pending_adapter_remove: None,
             loaded_config: None,
             loaded_location: None,
             edit_buffer: None,
@@ -164,6 +167,7 @@ impl AppState {
             parts_collect: Vec::new(),
             parts_scan_rx: None,
             parts_scanning: false,
+            parts_scan_done: false,
             parts_scan_progress: None,
             engine_search: String::new(),
             engine_mod_filter: None,
@@ -270,10 +274,29 @@ impl AppState {
     }
 
     pub fn engine_mod_entries(&self) -> Vec<&ModEntry> {
+        use crate::parts::engine_belongs_to_mod;
+
         self.mods
             .iter()
-            .filter(|m| m.kind == ModKind::EngineParts || m.engine_count > 0)
+            .filter(|m| {
+                if crate::mod_scanner::is_adapter_mod(&m.name) {
+                    return false;
+                }
+                if crate::mod_scanner::is_engine_mod(m) {
+                    return true;
+                }
+                self.parts_index
+                    .engines
+                    .iter()
+                    .any(|e| engine_belongs_to_mod(e, &m.name))
+            })
             .collect()
+    }
+
+    pub fn adapter_mod_entry(&self) -> Option<&ModEntry> {
+        self.mods
+            .iter()
+            .find(|m| crate::mod_scanner::is_adapter_mod(&m.name))
     }
 
     pub fn current_vehicle_model(&self) -> Option<String> {
@@ -291,6 +314,113 @@ impl AppState {
             }
         }
         None
+    }
+
+    pub fn adapter_supports_vehicle(&self, engine_mod: &str, vehicle: &str) -> bool {
+        let Some(adapter) = self.adapter_mod_entry() else {
+            return false;
+        };
+        let crate::mod_scanner::ModLocation::Unpacked { root } = &adapter.location else {
+            return false;
+        };
+        crate::mod_scanner::adapter_links_vehicle(root, vehicle, engine_mod)
+    }
+
+    pub fn mod_supports_vehicle(&self, m: &ModEntry, vehicle: &str) -> bool {
+        if m.target_vehicles
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case(vehicle))
+        {
+            return true;
+        }
+        if self.adapter_supports_vehicle(&m.name, vehicle) {
+            return true;
+        }
+        if let Some(v) = self.selected_vehicle() {
+            if m.name.eq_ignore_ascii_case(&v.mod_name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Engine options for the main slot dropdown, grouped by source mod.
+    /// Compatible mods (built-in, adapter, or this vehicle's home mod) are listed first.
+    pub fn engine_dropdown_groups(
+        &self,
+        slot: &str,
+        current: &str,
+    ) -> Vec<(String, bool, Vec<crate::parts::PartEntry>)> {
+        use std::collections::HashSet;
+
+        use crate::parts::{engine_belongs_to_mod, is_engine_slot_name, PartEntry};
+
+        if !is_engine_slot_name(slot) {
+            return Vec::new();
+        }
+
+        let vehicle = self.current_vehicle_model();
+        let mut mod_rows: Vec<(String, bool)> = Vec::new();
+
+        if let Some(v) = self.selected_vehicle() {
+            if !v.mod_name.is_empty()
+                && !mod_rows
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(&v.mod_name))
+            {
+                mod_rows.push((v.mod_name.clone(), true));
+            }
+        }
+
+        for m in self.engine_mod_entries() {
+            if mod_rows.iter().any(|(n, _)| n.eq_ignore_ascii_case(&m.name)) {
+                continue;
+            }
+            let compatible = vehicle
+                .as_ref()
+                .map(|model| self.mod_supports_vehicle(m, model))
+                .unwrap_or(false);
+            mod_rows.push((m.name.clone(), compatible));
+        }
+
+        mod_rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        let mut seen_ids = HashSet::new();
+        let mut groups = Vec::new();
+
+        for (mod_name, compatible) in mod_rows {
+            let mut engines: Vec<PartEntry> = self
+                .parts_index
+                .engines
+                .iter()
+                .filter(|e| engine_belongs_to_mod(e, &mod_name))
+                .filter(|e| seen_ids.insert(e.id.clone()))
+                .cloned()
+                .collect();
+            if engines.is_empty() {
+                continue;
+            }
+            engines.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+            groups.push((mod_name, compatible, engines));
+        }
+
+        if !current.is_empty() && !seen_ids.contains(current) {
+            let stub = if let Some(p) = self.parts_index.all_by_id.get(current) {
+                p.clone()
+            } else {
+                PartEntry {
+                    id: current.to_string(),
+                    name: format!("Current: {current}"),
+                    slot_type: slot.to_string(),
+                    mod_name: "installed".to_string(),
+                    is_engine: true,
+                    source_file: std::path::PathBuf::new(),
+                }
+            };
+            groups.insert(0, ("installed".to_string(), true, vec![stub]));
+        }
+
+        groups
     }
 
     pub fn mod_by_name(&self, name: &str) -> Option<&ModEntry> {

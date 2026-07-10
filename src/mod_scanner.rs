@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -291,10 +291,10 @@ fn analyze_mod_root(root: &Path) -> AppResult<ModStats> {
             continue;
         }
         match path.extension().and_then(|e| e.to_str()) {
-            Some("jbeam") => {
+            Some(ext) if ext.eq_ignore_ascii_case("jbeam") => {
                 jbeam_count += 1;
-                if is_engine_jbeam(path)? {
-                    engine_count += 1;
+                if let Ok(text) = fs::read_to_string(path) {
+                    engine_count += crate::parts::count_engines_in_jbeam_text(&text);
                 }
             }
             Some("pc") => {
@@ -334,7 +334,6 @@ fn analyze_mod_zip(zip_path: &Path) -> AppResult<ModStats> {
     let mut engine_count = 0usize;
     let mut jbeam_count = 0usize;
     let mut pc_count = 0usize;
-    let mut jbeam_texts: Vec<String> = Vec::new();
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
@@ -346,22 +345,13 @@ fn analyze_mod_zip(zip_path: &Path) -> AppResult<ModStats> {
                 }
             }
         }
-        if name.ends_with(".jbeam") {
+        if name.ends_with(".jbeam") || name.ends_with(".JBeam") {
             jbeam_count += 1;
             let mut text = String::new();
             file.read_to_string(&mut text)?;
-            jbeam_texts.push(text);
+            engine_count += crate::parts::count_engines_in_jbeam_text(&text);
         } else if name.ends_with(".pc") {
             pc_count += 1;
-        }
-    }
-
-    for text in jbeam_texts {
-        let lower = text.to_ascii_lowercase();
-        if lower.contains("\"slottype\"")
-            && (lower.contains("engine") || text.contains("Engine"))
-        {
-            engine_count += 1;
         }
     }
 
@@ -402,14 +392,204 @@ fn vehicle_folder_from_entry(entry: &str) -> Option<String> {
     None
 }
 
-fn is_engine_jbeam(path: &Path) -> AppResult<bool> {
-    let text = fs::read_to_string(path)?;
-    let lower = text.to_ascii_lowercase();
-    Ok(lower.contains("\"slottype\"")
-        && (lower.contains("engine") || path.to_string_lossy().to_ascii_lowercase().contains("engine")))
+const COMPAT_FILE: &str = ".beamng_editor_compat.json";
+
+/// Separate unpacked mod that holds per-vehicle engine adapter jbeams.
+pub const ADAPTER_MOD_FOLDER: &str = "beamng_editor_adapters";
+
+pub fn is_adapter_mod(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ADAPTER_MOD_FOLDER)
 }
 
-const COMPAT_FILE: &str = ".beamng_editor_compat.json";
+pub fn adapter_mod_dir(mods_root: &Path) -> PathBuf {
+    mods_root.join("unpacked").join(ADAPTER_MOD_FOLDER)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdapterCompat {
+    pub target_vehicles: Vec<String>,
+    pub engine_mod_links: BTreeMap<String, Vec<String>>,
+}
+
+pub fn read_adapter_compat(mod_root: &Path) -> AppResult<AdapterCompat> {
+    let path = mod_root.join(COMPAT_FILE);
+    if !path.exists() {
+        return Ok(AdapterCompat::default());
+    }
+    let text = fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let mut compat = AdapterCompat::default();
+    if let Some(arr) = value.get("target_vehicles").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                compat.target_vehicles.push(s.to_string());
+            }
+        }
+    }
+    if let Some(links) = value.get("engine_mod_links").and_then(|v| v.as_object()) {
+        for (vehicle, mods) in links {
+            let mut names = Vec::new();
+            if let Some(arr) = mods.as_array() {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        names.push(s.to_string());
+                    }
+                }
+            }
+            names.sort();
+            names.dedup();
+            compat.engine_mod_links.insert(vehicle.clone(), names);
+        }
+    }
+    compat.target_vehicles.sort();
+    compat.target_vehicles.dedup();
+    Ok(compat)
+}
+
+pub fn write_adapter_compat(mod_root: &Path, compat: &AdapterCompat) -> AppResult<()> {
+    let mut vehicles = compat.target_vehicles.clone();
+    vehicles.sort();
+    vehicles.dedup();
+    let mut links = serde_json::Map::new();
+    for (vehicle, mods) in &compat.engine_mod_links {
+        let arr: Vec<serde_json::Value> = mods.iter().map(|m| serde_json::Value::String(m.clone())).collect();
+        links.insert(vehicle.clone(), serde_json::Value::Array(arr));
+    }
+    let value = serde_json::json!({
+        "target_vehicles": vehicles,
+        "engine_mod_links": links,
+    });
+    fs::write(
+        mod_root.join(COMPAT_FILE),
+        serde_json::to_string_pretty(&value)?,
+    )?;
+    Ok(())
+}
+
+pub fn vehicles_linked_to_engine_mod(adapter_root: &Path, engine_mod: &str) -> Vec<String> {
+    let compat = read_adapter_compat(adapter_root).unwrap_or_default();
+    let engine_lower = engine_mod.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for (vehicle, mods) in &compat.engine_mod_links {
+        if mods
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(&engine_lower) || m.eq_ignore_ascii_case(engine_mod))
+        {
+            out.push(vehicle.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
+pub fn adapter_links_vehicle(adapter_root: &Path, vehicle: &str, engine_mod: &str) -> bool {
+    let compat = read_adapter_compat(adapter_root).unwrap_or_default();
+    compat
+        .engine_mod_links
+        .get(vehicle)
+        .map(|mods| {
+            mods.iter()
+                .any(|m| m.eq_ignore_ascii_case(engine_mod))
+        })
+        .unwrap_or(false)
+}
+
+pub fn is_listable_mod(entry: &ModEntry) -> bool {
+    !is_adapter_mod(&entry.name) && (entry.jbeam_count > 0 || entry.pc_count > 0)
+}
+
+pub fn is_engine_mod(entry: &ModEntry) -> bool {
+    !is_adapter_mod(&entry.name)
+        && (entry.kind == ModKind::EngineParts
+            || entry.engine_count > 0
+            || (entry.jbeam_count > 0 && entry.pc_count == 0))
+}
+
+fn resolve_template_folder(
+    adapter_root: &Path,
+    engine_mod: Option<&ModEntry>,
+    template: Option<&str>,
+) -> Option<PathBuf> {
+    let template_name = template?;
+    let adapter_src = adapter_root.join("vehicles").join(template_name);
+    if adapter_src.is_dir() {
+        return Some(adapter_src);
+    }
+    if let Some(entry) = engine_mod {
+        if let Some(root) = mod_root_path(entry) {
+            let engine_src = root.join("vehicles").join(template_name);
+            if engine_src.is_dir() {
+                return Some(engine_src);
+            }
+        }
+    }
+    None
+}
+
+pub fn add_vehicle_adapter_for_engine_mod(
+    settings: &AppSettings,
+    engine_mod: &ModEntry,
+    vehicle: &str,
+    template: Option<&str>,
+) -> AppResult<()> {
+    let mods_root = mods_dir(settings)?;
+    let adapter_root = adapter_mod_dir(&mods_root);
+    fs::create_dir_all(&adapter_root)?;
+
+    if adapter_links_vehicle(&adapter_root, vehicle, &engine_mod.name) {
+        return Err(AppError::msg(format!(
+            "{vehicle} already has an adapter for {}",
+            engine_mod.name
+        )));
+    }
+
+    let vehicle_dir = adapter_root.join("vehicles").join(vehicle);
+    if !vehicle_dir.is_dir() {
+        if let Some(src) = resolve_template_folder(&adapter_root, Some(engine_mod), template) {
+            copy_engine_jbeams(&src, &vehicle_dir)?;
+        } else {
+            add_vehicle_folder(&adapter_root, vehicle, None)?;
+        }
+    }
+
+    let mut compat = read_adapter_compat(&adapter_root)?;
+    if !compat.target_vehicles.iter().any(|v| v == vehicle) {
+        compat.target_vehicles.push(vehicle.to_string());
+        compat.target_vehicles.sort();
+    }
+    let links = compat.engine_mod_links.entry(vehicle.to_string()).or_default();
+    if !links.iter().any(|m| m.eq_ignore_ascii_case(&engine_mod.name)) {
+        links.push(engine_mod.name.clone());
+        links.sort();
+    }
+    write_adapter_compat(&adapter_root, &compat)?;
+    Ok(())
+}
+
+pub fn remove_vehicle_adapter_for_engine_mod(
+    settings: &AppSettings,
+    engine_mod: &str,
+    vehicle: &str,
+) -> AppResult<()> {
+    let mods_root = mods_dir(settings)?;
+    let adapter_root = adapter_mod_dir(&mods_root);
+    if !adapter_root.is_dir() {
+        return Err(AppError::msg("Adapter mod not found"));
+    }
+
+    let mut compat = read_adapter_compat(&adapter_root)?;
+    let Some(links) = compat.engine_mod_links.get_mut(vehicle) else {
+        return Err(AppError::msg(format!("No adapter for {vehicle}")));
+    };
+    links.retain(|m| !m.eq_ignore_ascii_case(engine_mod));
+    if links.is_empty() {
+        compat.engine_mod_links.remove(vehicle);
+        compat.target_vehicles.retain(|v| v != vehicle);
+        remove_vehicle_folder(&adapter_root, vehicle)?;
+    }
+    write_adapter_compat(&adapter_root, &compat)?;
+    Ok(())
+}
 
 pub fn read_compat_file(mod_root: &Path) -> AppResult<Vec<String>> {
     let path = mod_root.join(COMPAT_FILE);

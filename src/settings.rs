@@ -150,6 +150,34 @@ impl AppSettings {
             || self.game_vehicles_dir().is_some()
             || self.game_loose_vehicles_dir().is_some()
     }
+
+    pub fn open_in_file_manager(path: &Path) -> AppResult<()> {
+        if !path.exists() {
+            return Err(AppError::msg(format!("Path does not exist: {}", path.display())));
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("explorer")
+                .arg(path)
+                .spawn()
+                .map_err(|e| AppError::msg(format!("Failed to open folder: {e}")))?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("open")
+                .arg(path)
+                .spawn()
+                .map_err(|e| AppError::msg(format!("Failed to open folder: {e}")))?;
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            std::process::Command::new("xdg-open")
+                .arg(path)
+                .spawn()
+                .map_err(|e| AppError::msg(format!("Failed to open folder: {e}")))?;
+        }
+        Ok(())
+    }
 }
 
 fn resolve_game_root(exe: &Path) -> Option<PathBuf> {

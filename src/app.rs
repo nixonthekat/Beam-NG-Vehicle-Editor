@@ -206,7 +206,10 @@ impl BeamNgVehicleEditor {
                             self.state.vehicles.len()
                         )));
                     }
-                    if self.state.parts_index.all_by_id.is_empty() {
+                    if !self.state.parts_scan_done
+                        && !self.state.parts_scanning
+                        && self.state.parts_index.all_by_id.is_empty()
+                    {
                         self.state.request_parts_scan = true;
                     }
                 }
@@ -275,14 +278,19 @@ impl BeamNgVehicleEditor {
                 .push_toast(Toast::error("Set BeamNG user folder or BeamNG.exe in Settings"));
             return;
         }
+        if self.state.parts_scanning {
+            return;
+        }
 
         self.state.parts_scanning = true;
+        self.state.parts_scan_done = false;
         self.state.parts_collect.clear();
         self.state.parts_scan_rx = Some(PartsScanner::spawn_scan(self.state.settings.clone()));
     }
 
     fn poll_parts_scan(&mut self) {
         let mut finished = false;
+        let mut errored = false;
         let mut messages = Vec::new();
 
         if let Some(rx) = &self.state.parts_scan_rx {
@@ -299,30 +307,32 @@ impl BeamNgVehicleEditor {
                 PartsScanMessage::Part(p) => {
                     self.state.parts_collect.push(p);
                 }
-                PartsScanMessage::Finished { total: _ } => {
+                PartsScanMessage::Finished { total } => {
                     finished = true;
                     self.state.parts_index = crate::parts::PartsIndex::finalize_from_parts(
                         std::mem::take(&mut self.state.parts_collect),
                     );
                     let engine_count = self.state.parts_index.engines.len();
-                    let mod_count = self.state.parts_index.engine_mods.len();
                     self.state.push_toast(Toast::info(format!(
-                        "Parts loaded: {engine_count} engines from {mod_count} engine mod(s)"
+                        "Loaded {engine_count} engines from mods"
                     )));
                     if self.state.selected_engine_mod.is_none() {
                         if let Some(first) = self.state.engine_mod_entries().first() {
                             self.state.selected_engine_mod = Some(first.name.clone());
                         }
                     }
+                    let _ = total;
                 }
                 PartsScanMessage::Error(err) => {
+                    errored = true;
                     self.state.push_toast(Toast::error(err));
                 }
             }
         }
 
-        if finished {
+        if finished || errored {
             self.state.parts_scanning = false;
+            self.state.parts_scan_done = true;
             self.state.parts_scan_rx = None;
             self.state.parts_scan_progress = None;
         }
@@ -370,7 +380,10 @@ impl BeamNgVehicleEditor {
                 self.state.status_message = format!("Loaded {}", entry.name);
                 self.state.push_toast(Toast::info(format!("Editing {}", entry.name)));
                 self.state.tab = crate::state::AppTab::Editor;
-                if self.state.parts_index.all_by_id.is_empty() && !self.state.parts_scanning {
+                if !self.state.parts_scan_done
+                    && !self.state.parts_scanning
+                    && self.state.parts_index.all_by_id.is_empty()
+                {
                     self.state.request_parts_scan = true;
                 }
             }
@@ -391,48 +404,6 @@ impl BeamNgVehicleEditor {
                 .push_toast(Toast::error("No vehicle loaded — open a car in the editor first"));
             return;
         };
-        if mod_entry.target_vehicles.iter().any(|v| v == &vehicle) {
-            self.state
-                .push_toast(Toast::info(format!("{vehicle} is already supported by {}", mod_entry.name)));
-            return;
-        }
-
-        if !crate::mod_scanner::is_editable(&mod_entry) {
-            if let crate::mod_scanner::ModLocation::Zip { archive_path } = &mod_entry.location {
-                let mods_root = match crate::mod_scanner::mods_dir(&self.state.settings) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        self.state.push_toast(Toast::error(e.to_string()));
-                        return;
-                    }
-                };
-                match crate::mod_scanner::unpack_mod(archive_path, &mods_root) {
-                    Ok(dest) => {
-                        self.state.push_toast(Toast::info(format!(
-                            "Unpacked to {}",
-                            dest.display()
-                        )));
-                        let template = if self.state.mod_template_vehicle.is_empty() {
-                            None
-                        } else {
-                            Some(self.state.mod_template_vehicle.as_str())
-                        };
-                        match crate::mod_scanner::add_vehicle_folder(&dest, &vehicle, template) {
-                            Ok(()) => {
-                                self.state.push_toast(Toast::info(format!(
-                                    "Added {vehicle} to {}",
-                                    mod_entry.name
-                                )));
-                                self.state.request_rescan = true;
-                            }
-                            Err(e) => self.state.push_toast(Toast::error(e.to_string())),
-                        }
-                    }
-                    Err(e) => self.state.push_toast(Toast::error(e.to_string())),
-                }
-            }
-            return;
-        }
 
         let template = if self.state.mod_template_vehicle.is_empty() {
             mod_entry.target_vehicles.first().map(|s| s.as_str())
@@ -440,11 +411,17 @@ impl BeamNgVehicleEditor {
             Some(self.state.mod_template_vehicle.as_str())
         };
 
-        match crate::mod_scanner::add_vehicle_to_mod(&mod_entry, &vehicle, template) {
+        match crate::mod_scanner::add_vehicle_adapter_for_engine_mod(
+            &self.state.settings,
+            &mod_entry,
+            &vehicle,
+            template,
+        ) {
             Ok(()) => {
                 self.state.push_toast(Toast::info(format!(
-                    "Added {vehicle} to mod {}",
-                    mod_entry.name
+                    "Created adapter for {vehicle} → {} (enable {} in BeamNG)",
+                    mod_entry.name,
+                    crate::mod_scanner::ADAPTER_MOD_FOLDER
                 )));
                 self.state.request_rescan = true;
             }

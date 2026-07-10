@@ -11,6 +11,7 @@ pub use theme::{
 
 use egui::{Align, Color32, Layout, RichText, Ui};
 
+use crate::settings::AppSettings;
 use crate::state::{AppState, AppTab};
 
 pub fn top_bar(ui: &mut Ui, state: &mut AppState) {
@@ -183,6 +184,16 @@ fn draw_settings(ui: &mut Ui, state: &mut AppState) {
         if ui.button("Browse…").clicked() {
             state.request_user_browse = true;
         }
+        if ui.button("Open").clicked() {
+            if let Some(path) = state.settings.effective_user_dir() {
+                match AppSettings::open_in_file_manager(&path) {
+                    Ok(()) => {}
+                    Err(e) => state.push_toast(crate::state::Toast::error(e.to_string())),
+                }
+            } else {
+                state.push_toast(crate::state::Toast::error("User folder not set"));
+            }
+        }
     });
 
     ui.horizontal(|ui| {
@@ -195,6 +206,16 @@ fn draw_settings(ui: &mut Ui, state: &mut AppState) {
         ui.label(RichText::new(path_text).monospace());
         if ui.button("Browse…").clicked() {
             state.request_mods_browse = true;
+        }
+        if ui.button("Open").clicked() {
+            if let Some(path) = state.settings.mods_dir() {
+                match AppSettings::open_in_file_manager(&path) {
+                    Ok(()) => {}
+                    Err(e) => state.push_toast(crate::state::Toast::error(e.to_string())),
+                }
+            } else {
+                state.push_toast(crate::state::Toast::error("Mods folder not found"));
+            }
         }
     });
 
@@ -209,6 +230,17 @@ fn draw_settings(ui: &mut Ui, state: &mut AppState) {
         ui.label(RichText::new(exe_text).monospace());
         if ui.button("Browse…").clicked() {
             state.request_exe_browse = true;
+        }
+        if ui.button("Open").clicked() {
+            if let Some(path) = state.settings.beamng_exe_path.as_ref() {
+                let open_path = path.parent().unwrap_or(path.as_path());
+                match AppSettings::open_in_file_manager(open_path) {
+                    Ok(()) => {}
+                    Err(e) => state.push_toast(crate::state::Toast::error(e.to_string())),
+                }
+            } else {
+                state.push_toast(crate::state::Toast::error("BeamNG exe not set"));
+            }
         }
     });
 
